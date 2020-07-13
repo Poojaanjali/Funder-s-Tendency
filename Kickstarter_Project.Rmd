@@ -1,0 +1,429 @@
+---
+title: "Kickstarter Projects [EDA & Classification]"
+date: "October 29, 2018"
+output: 
+        html_document:
+                fig_height: 8
+                fig_width: 12
+                highlight: tango
+                toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE , warning = FALSE , error = FALSE , message = FALSE)
+```
+
+# Introduction
+
+In this kernel, we will explore [Kickstarter](https://www.kickstarter.com/) and try to gain insights to understand funders' tendencies when they 're considering these projects. After the Exploratory Data Analysis, we 'll try predict whether a project will be funded successfully.
+
+# Load Data and Libraries
+
+```{r load}
+# Load libraries
+library(tidyverse)
+library(ggthemes)
+library(caret)
+library(gridExtra)
+library(GGally)
+library(randomForest)
+library(xgboost)
+
+#Load data
+kick <- read_csv("C:\\Users\\Pooja\\Downloads\\ks-projects-201801.csv\\ks-projects-201801.csv")
+
+head(kick)
+
+```
+
+Our dataset contains of *`r dim(kick)[1]`* rows and *`r dim(kick)[2]`* columns.
+
+# Knowing the data
+## Knowing the variables
+
+Types of the variables:
+```{r glimpse}
+glimpse(kick)
+```
+
+Description of the variables
+
+* **name** : name of project 
+* **main_category** : category of campaign
+* **currency** : currency used to support
+* **deadline** : deadline for crowdfunding
+* **goal** : fundraising goal
+* **launched** : date launched
+* **pledged** : amount pledged by crowd
+* **state** : current condition the project is in
+* **backers** : number of backers
+* **country** : country pledged from
+* **usd pledged** : amount of money pledged
+* **usd_pledged_real** : conversion in US dollars of the pledged column
+* **usd_goal_real** : conversion in US dollars of the goal column
+
+## Missing Values
+
+```{r missing}
+column_nas<- function(dataframe) {
+        na_vals<- sapply(kick , function(x) mean(is.na(x)))
+        nas <- data.frame(column_names = names(na_vals) , na_percentage <- as.vector(na_vals))
+        ggplot(nas , aes(x = reorder(column_names , na_percentage) , y = na_percentage , label = paste(as.character(round(na_percentage * 100 , 1)) , "%"))) +
+                geom_col(fill = "lightblue") + xlab('Names of columns') + ylab("NA's Percentage") +
+                labs(title = "Column NA's Percentage") + geom_text(color = 'darkblue') + theme_igray() + coord_flip()
+}
+
+column_nas(kick)
+```
+
+Not much of a problem. For the conversion in US dollars we 'll use the *usd_pledged_real* variable.
+
+# Data Cleaning & Feature Engineering
+
+```{r remove nas , echo = FALSE}
+kick = kick[complete.cases(kick) , -1]
+```
+
+We don't really care about the exact time a project was launched so we 'll keep only the date from the launched column.
+
+```{r only_date}
+# Select 10 first characters and convert into year-month-day format
+kick$launched = str_sub(kick$launched , 1 , 10) %>% lubridate::ymd()
+```
+
+An additional feature could be time interval from *launched* to *deadline* time. This would be a numeric variable counted in days and it will be a possible predictor for our model. For the exploratory part, a variable indicating the ratio of pledged amount to goal amount. Let's create these two features.
+
+```{r time_int}
+kick = kick %>% mutate(time_int = I(as.numeric(deadline) - as.numeric(launched)) , pledged_ratio = pledged / goal)
+```
+
+```{r clean1}
+# Quantiles of time_int variable
+kick$time_int = as.numeric(kick$time_int)
+quantile(kick$time_int , probs = seq(0 , 1 , 0.1))
+```
+There are 7 observations supposedly launched in 1970-01-01. To get a more realistic launched date, i 'll subtract the median days of the *time_int* variable from deadline date which is 30 days. 
+
+```{r clean2}
+kick %>% filter(time_int > 500) %>% select(launched , deadline , time_int)
+kick$launched[kick$time_int > 500] = kick$deadline[kick$time_int > 500] - 30
+kick$time_int[kick$time_int > 500] = 30
+kick$goal = as.numeric(kick$goal)
+```
+
+We also have 
+
+* Two observations with pledged ratio smaller than 1 classified as successful
+* Six observations with pledged ratio above or equal to 1 classified as failed
+
+```{r}
+kick$state[kick$pledged_ratio < 0.999 & kick$state == 'successful'] = 'failed'
+kick$state[kick$pledged_ratio >= 1 & kick$state == 'failed'] = 'successful'
+```
+
+
+# Exploratory Data Analysis
+
+First, let's see the distribution of state variable.
+
+```{r plot1}
+# Barplot state
+kick %>% group_by(state) %>% 
+        summarise(count = n() , percentage = paste(round((count / dim(kick)[1])*100 , 1) , '%' , sep = '')) %>% 
+        ggplot(aes(x = reorder(state , desc(count)) , y = count , fill = state , label = percentage)) + 
+        geom_col() + geom_text(size = 6 , vjust = -0.2) + 
+        labs(x = '' , y = 'Count') + theme_economist() + theme(legend.position = 'none') + 
+        theme(axis.text.x = element_text(size = 13 , face = 'bold'))
+```
+
+
+```{r plot2}
+p1 = kick %>% filter(state %in% c('successful' , 'failed')) %>% select(state , usd_pledged_real) %>%
+        ggplot(aes(usd_pledged_real , fill = state)) + geom_density(alpha = 0.65) + 
+        labs(x = 'Pledged Amount (USD)' , title = 'Pledged Value Distribution') + 
+        scale_fill_manual(values = c('darkred' , 'darkgreen'))
+
+p2 = kick %>% filter(state %in% c('successful' , 'failed')) %>% select(state , usd_pledged_real) %>%
+        ggplot(aes(log(usd_pledged_real+1) , fill = state)) + geom_density(alpha = 0.65) + 
+        labs(x = 'log(Pledged Amount + 1) (USD)' , title = 'Logarithmic Pledged Value Distribution') + 
+        scale_fill_manual(values = c('darkred' , 'darkgreen')) + 
+        theme(legend.position = 'none')
+
+p3 = kick %>% filter(state %in% c('successful' , 'failed')) %>% select(state , usd_goal_real) %>%
+        ggplot(aes(usd_goal_real , fill = state)) + geom_density(alpha = 0.65) + 
+        labs(x = 'Goal Amount (USD)' , title = 'Goal Value Distribution') + 
+        scale_fill_manual(values = c('darkred' , 'darkgreen'))
+
+p4 = kick %>% filter(state %in% c('successful' , 'failed')) %>% select(state , usd_goal_real) %>%
+        ggplot(aes(log(usd_goal_real+1) , fill = state)) + geom_density(alpha = 0.65) + 
+        labs(x = 'log(Goal Amount + 1) (USD)' , title = 'Logarithmic Goal Value Distribution') + 
+        scale_fill_manual(values = c('darkred' , 'darkgreen')) + 
+        theme(legend.position = 'none')
+
+grid.arrange(p1 , p2 , p3 , p4 , nrow = 2)
+```
+```{r , echo = FALSE}
+rm(p1 , p2 , p3 , p4)
+```
+
+* Plots in the first column indicate there are outliers both in the plegded and goal amount.
+* As expected the more the pledged amount the better probability of success.
+* The more the goal amount the fewer probability of success.
+
+```{r plot3}
+kick %>% filter(state %in% c('successful' , 'failed')) %>%
+        ggplot(aes(x = state , y = pledged_ratio , fill = state)) + geom_boxplot(alpha = 0.8) + 
+        ylim(0 , 1.5) + theme_economist() + theme(legend.position = 'none') +
+        scale_fill_manual(values = c('darkred' , 'darkgreen')) + labs(x = '' , y = 'Pledged Ratio')
+```
+```{r quantiles}
+# Quantiles of failed projects pledged_ratio
+round(quantile(kick$pledged_ratio[kick$state == 'failed'] , probs = seq(0.1 , 0.9 , 0.1)) , 4)
+```
+
+By this graph it is obvious there are very few projects that surpass the threshold of 50% of the total amount needed and fail to be totally funded. It is reasonable for an investor to feel more safe about a project pledged for example 70% at the given moment. As shown above, the 90th percentile of failed projects don't even get to 30% of the amount they need.
+
+```{r plot4}
+# Remove the 99th percentile of outliers from pledged_ratio variable
+kick %>% filter(pledged_ratio < quantile(pledged_ratio , probs = 0.99)) %>% group_by(main_category) %>% 
+        summarise(mean_pledged = mean(pledged_ratio) , mean_goal = mean(usd_goal_real)) %>%
+        ggplot(aes(x = mean_pledged , y = mean_goal , label = main_category , color = main_category)) + 
+        geom_point(size = 3) + geom_text(vjust = -0.75) + xlim(c(0.3 , 1.15)) + ylim(c(0 , 115000)) +
+        theme_igray() + theme(legend.position = 'none') + 
+        labs(x = 'Average Pledged Ratio' , y = 'Average Goal Amount')
+        
+```
+
+```{r cor , echo = TRUE}
+paste('Correlation between Pledged and Goal amount:' , round(cor(kick$pledged , kick$usd_goal_real) , 5))
+```
+
+* No significant correlation between Pledged and Goal amount.
+* Comics and Games do well on average when it comes to money received by backers.
+* Journalism and Technology projects demand a big amount of investment, therefore it is more difficult to achieve their funding goals.
+
+Correlation of numerical features
+
+```{r corrplot}
+kick %>% select(usd_goal_real , usd_pledged_real , pledged_ratio , time_int , backers) %>% 
+        ggpairs(mapping = aes(color = 'darkblue'))
+```
+
+There are no significant correlations except 0.753 between the number of backers and pledged amount in USD.
+
+# Various Modelling Approaches
+
+## Prepare data for Modelling
+
+Tasks needed to be made in order to be able to perform modelling:
+
+* Create the binary response variable (where 0 -> failed  ,  1 -> successful).
+* Select the numerical variables as predictors.
+* Create Dummy Variables for the selected categorical features.
+
+```{r preparation_tasks}
+data = kick %>% select(category , country , usd_goal_real , time_int , state) %>% 
+        filter(state %in% c('successful' , 'failed')) %>% 
+        mutate(state = as.factor(ifelse(state == 'successful' , 1 , 0))) %>%
+        mutate_if(is.character , as.factor)
+
+data = data.frame(model.matrix( ~ . -1 , data))
+colnames(data)[ncol(data)] = 'state'
+data$state = as.factor(data$state)
+```
+
+With this coding, we transform our dataframe in matrix where the categorical variables are represented with 0's and 1's.
+
+
+## Train-Test Split
+
+```{r split}
+set.seed(123)
+index = sample(dim(data)[1] , dim(data)[1]*0.75 , replace = FALSE)
+trainset = data[index , ]
+testset = data[-index , ]
+
+```
+```{r , echo = FALSE}
+rm(index)
+```
+
+
+## Logistic Regression
+
+Logistic regression is a technique that is well suited for examining the relationship between a categorical response variable and one or more categorical or continuous predictor variables.
+
+```{r log_reg}
+log.fit = glm(state ~ . , trainset , family = binomial(link = 'logit'))
+probs = predict(log.fit , testset , type = 'response')
+
+qplot(probs , geom = 'density') + geom_density(fill = 'lightblue' , alpha = 0.6) +
+        labs(x = 'Probabilities' , title = 'LOGISTIC REGRESSION - Probabilities assigned to test set')
+```
+
+
+
+```{r threshold}
+accuracy = c()
+sensitivity = c()
+specificity = c()
+k = 1
+for(i in seq(0.01 , 1 , by = 0.01)){
+        preds = factor(ifelse(probs > i , 1 , 0) , levels = c('0' , '1'))
+        confmat = confusionMatrix(testset$state , preds)
+        accuracy[k] = confmat$overall[[1]]
+        sensitivity[k] = confmat$byClass[[1]]
+        specificity[k] = confmat$byClass[[2]]
+        k = k + 1
+}
+
+d = data.frame(threshold = seq(0.01 , 1 , by = 0.01) , accuracy , sensitivity , specificity) 
+
+gather(d , key = 'Metric' , value = 'Value' , 2:4) %>%
+        ggplot(aes(x = threshold , y = Value , color = Metric)) + geom_line(size = 1) + 
+        scale_color_manual(values = c('darkred' , 'lightblue' , 'lightgreen')) +
+        geom_vline(xintercept = 0.51 , color = 'darkgrey') + 
+        geom_hline(yintercept = max(accuracy) , color = 'darkgrey') +
+        labs(title = 'LOGISTIC REGRESSION') + xlim(c(0 , 0.75))
+```
+
+```{r , echo = FALSE}
+rm(i , k , preds , confmat , d , accuracy , sensitivity , specificity)
+```
+
+The best Accuracy occurs when the cut off probability threshold is **51%**.
+
+Let's see the Confusion Matrix for 51% threshold.
+
+```{r confmat0.435}
+confmat = table(Actual = testset$state , Predictions = ifelse(probs > 0.51 , 1 , 0))
+confmat
+paste('Accuracy:' , sum(diag(confmat)) / sum(confmat))
+Acc_models = list()
+Acc_models['Logistic Regression'] = sum(diag(confmat)) / sum(confmat)
+```
+```{r , echo = FALSE}
+rm(confmat , probs , log.fit)
+```
+
+
+## Random Forest
+
+Random Forests are similar to a famous Ensemble technique called Bagging but have a different tweak in it. In Random Forests the idea is to decorrelate the several trees which are generated by the different bootstrapped samples from training Data. And then we simply reduce the Variance in the Trees by averaging them.Averaging the Trees helps us to reduce the variance and also improve the Performance of Decision Trees on Test Set and eventually avoid Overfitting.
+
+```{r rf_model}
+rf.fit = randomForest(state ~ . , trainset[sample(dim(trainset)[1] , 50000) , ] , ntree = 500)
+rf.fit
+
+```
+
+We get an Out-Of-Bag error of `r (rf.fit$err.rate[500 , 1][[1]])*100`%. More trees would improve our model?
+
+```{r ntrees}
+data.frame(rf.fit$err.rate , ntrees = 1:500) %>% gather(key = 'Type.of.error' , value = 'Error' , 1:3) %>%
+        ggplot(aes(x = ntrees , y = Error , color = Type.of.error)) + geom_line(size = 1) + 
+        labs(x = 'Number of Trees' , title = 'Number of Trees Vs Error Rate')
+```
+
+More trees would not improve the accuracy of the model.
+
+Let's try it on the test set.
+
+```{r accuracy.rf}
+preds = predict(rf.fit , testset)
+# Confusion Matrix of test set
+confmat = table(Actual = testset$state , Predictions = preds)
+confmat
+paste('Accuracy:' , sum(diag(confmat)) / sum(confmat))
+Acc_models['Random Forest'] = sum(diag(confmat)) / sum(confmat)
+```
+```{r , echo = FALSE}
+rm(preds , confmat , rf.fit)
+```
+
+
+## Extreme Gradient Boosting
+
+XGBoost (eXtreme Gradient Boosting) is one of the most loved machine learning algorithms at Kaggle. It can be used for supervised learning tasks such as Regression, Classification, and Ranking. It is built on the principles of gradient boosting framework and designed to push the extreme of the computation limits of machines to provide a scalable, portable and accurate library.
+
+```{r xgboost}
+# Tune Parameters
+params = list(booster = 'gbtree' , 
+              objective = 'binary:logistic' , 
+              eta = 0.2 , 
+              gamma = 0 , 
+              max_depth = 5 , 
+              min_child_weight = 1 , 
+              subsample = 1 , 
+              colsample_bytree = 1)
+
+trainset$state = as.numeric(as.character(trainset$state))
+testset$state = as.numeric(as.character(testset$state))
+
+
+# Using the inbuilt xgb.cv function, let's calculate the best nround for this model. In addition, this function also returns CV error, which is an estimate of test error.
+# xgbcv = xgb.cv(data = data.matrix(select(trainset , -state)) ,
+#                label = data.matrix(trainset$state) ,
+#                params = params ,
+#                nrounds = 400 ,
+#                nfold = 4 ,
+#                showsd = TRUE ,
+#                stratified = TRUE ,
+#                print_every_n = 20 ,
+#                early_stopping_rounds = 20 ,
+#                maximize = FALSE)
+
+best.iter = 228
+
+dtrain = xgb.DMatrix(data = data.matrix(trainset[ , -ncol(trainset)]) , label = data.matrix(trainset$state))
+dtest = xgb.DMatrix(data = data.matrix(testset[ , -ncol(testset)]) , label = data.matrix(testset$state))
+
+xgb.fit = xgb.train(params = params , 
+                    data = dtrain , 
+                    nrounds = best.iter , 
+                    watchlist = list(val = dtest , train = dtrain) , 
+                    print_every_n = 20 , 
+                    early_stopping_rounds = 20 , 
+                    maximize = FALSE , 
+                    eval_metric = 'error')
+
+```
+
+```{r xgb}
+# Probabilitites predicted on testset
+probs = predict(xgb.fit , dtest)
+
+qplot(probs , geom = 'density') + geom_density(fill = 'darkgreen' , alpha = 0.6) +
+        labs(x = 'Probabilities' , title = 'XGBOOST - Probabilities assigned to test set')
+```
+```{r , echo = FALSE}
+rm(dtrain , dtest , params)
+```
+
+
+The best Accuracy occurs when the cut off probability threshold is **49%**.
+
+Let's see the Confusion Matrix for 49% threshold.
+
+```{r cutoff.49}
+confmat = table(Actual = testset$state , Predictions = ifelse(probs > 0.49 , 1 , 0))
+confmat
+paste('Accuracy:' , sum(diag(confmat)) / sum(confmat))
+Acc_models['XGBOOST'] = sum(diag(confmat)) / sum(confmat)
+```
+```{r , echo = FALSE}
+rm(confmat , probs , xgb.fit , best.iter)
+```
+
+
+# Conclusions
+
+Three models we used gave these accuracy metrics. As expected the better was gradient boosting but not with large difference.
+
+```{r models}
+Acc_models
+```
+
+
+
+
